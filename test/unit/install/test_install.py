@@ -12,6 +12,10 @@ import typing
 
 import pytest
 
+from deadline_worker_agent.config.settings import (
+    DEFAULT_POSIX_SESSION_ROOT_DIR,
+    DEFAULT_WINDOWS_SESSION_ROOT_DIR,
+)
 from deadline_worker_agent.installer import (
     ParsedCommandLineArguments,
     install,
@@ -328,3 +332,28 @@ class TestGetEc2Region:
             f"AWS region could not be detected, got unexpected availability zone from IMDS: {az}"
             in out
         )
+
+
+class TestArgumentParserSessionRootDir:
+    """Tests for the default value of the installer's --session-root-dir argument"""
+
+    @pytest.mark.parametrize(
+        argnames=("platform", "expected_default"),
+        argvalues=(
+            pytest.param("linux", DEFAULT_POSIX_SESSION_ROOT_DIR, id="linux"),
+            pytest.param("win32", DEFAULT_WINDOWS_SESSION_ROOT_DIR, id="windows"),
+        ),
+    )
+    def test_default(self, platform: str, expected_default: Path) -> None:
+        """Asserts that the installer defaults --session-root-dir to the platform's default session
+        root directory used by the worker agent"""
+        # GIVEN
+        arg_parser = installer_mod.get_argument_parser()
+
+        # WHEN
+        parsed_args = arg_parser.parse_args(
+            args=["--farm-id", "farm-1", "--fleet-id", "fleet-1", "--region", "us-west-2"],
+        )
+
+        # THEN
+        assert Path(parsed_args.session_root_dir) == expected_default

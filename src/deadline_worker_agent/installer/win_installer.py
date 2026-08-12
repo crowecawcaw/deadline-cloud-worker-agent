@@ -456,6 +456,10 @@ def provision_directories(
 
     logging.info(f"Porvisioning session root directory ({session_root_dir})")
     os.makedirs(session_root_dir, exist_ok=True)
+    # Permission inheritance is disabled so that the session root directory keeps the least
+    # privilege permissions set below. The default session root directory is a child of the system
+    # drive's root directory, which carries an inherit-only ACE granting "Authenticated Users"
+    # modify access to the directories created under it.
     _set_windows_permissions(
         path=session_root_dir,
         user=agent_username,
@@ -464,6 +468,7 @@ def provision_directories(
         group_permission=FileSystemPermissionEnum.FULL_CONTROL,
         agent_user_permission=None,
         users_group_permission=FileSystemPermissionEnum.LIST_DIRECTORY_AND_READ,
+        disable_permission_inheritance=True,
     )
     logging.info(f"Done provisioning session root directory ({session_root_dir})")
 

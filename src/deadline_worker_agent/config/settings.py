@@ -27,9 +27,12 @@ DEFAULT_WINDOWS_WORKER_PERSISTENCE_DIR = Path(
 )
 
 DEFAULT_POSIX_SESSION_ROOT_DIR = Path("/sessions")
-DEFAULT_WINDOWS_SESSION_ROOT_DIR: Path = (
-    Path(os.getenv("PROGRAMDATA", "C:\\ProgramData")) / "Amazon" / "OpenJD"
-)
+# The session root directory is a prefix of every path that a Job's programs work with. Many
+# applications used in Jobs are not long-path aware, so they remain subject to the legacy Windows
+# MAX_PATH (260 character) limit no matter how the host or the Worker Agent is configured. The
+# default is kept short so that as much of that budget as possible is left for the Job's own paths.
+# The installer provisions this directory with least privilege permissions.
+DEFAULT_WINDOWS_SESSION_ROOT_DIR: Path = Path(os.getenv("SYSTEMDRIVE", "C:") + r"\OpenJD")
 
 
 class WorkerSettings(BaseSettings):

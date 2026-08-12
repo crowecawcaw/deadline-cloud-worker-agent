@@ -258,8 +258,11 @@ $ErrorActionPreference = 'Stop'
         job.assert_single_task_log_contains(
             deadline_client=deadline_client,
             logs_client=logs_client,
+            # The session directory is a child of the configured session root directory. The name
+            # of that child directory is owned by the openjd-sessions library and is deliberately
+            # not asserted on here.
             expected_pattern=re.compile(
-                f"^{re.escape(session_root_dir)}[\\\\/]session-[a-f0-9]{{32}}.*$", re.MULTILINE
+                f"^{re.escape(session_root_dir)}[\\\\/][^\\\\/\\n]+$", re.MULTILINE
             ),
             assert_fail_msg=f"Session root directory ({session_root_dir}) not applied",
         )

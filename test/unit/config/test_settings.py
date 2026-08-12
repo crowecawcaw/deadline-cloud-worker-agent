@@ -5,6 +5,7 @@
 from __future__ import annotations
 from unittest.mock import MagicMock, Mock, patch
 from typing import Any, Generator, NamedTuple, Type
+import importlib
 import pytest
 import os
 from pathlib import Path
@@ -186,7 +187,7 @@ FIELD_TEST_CASES: list[FieldTestCaseParams] = [
         expected_default=(
             Path("/sessions")
             if os.name == "posix"
-            else Path(os.getenv("PROGRAMDATA", "C:\\ProgramData")) / "Amazon" / "OpenJD"
+            else Path(os.getenv("SYSTEMDRIVE", "C:") + r"\OpenJD")
         ),
         expected_default_factory_return_value=None,
     ),
@@ -237,6 +238,71 @@ def test_settings_field_coverage() -> None:
 
     # THEN
     assert model_field_test_cases == model_fields, "Test cases mismatch from model fields"
+
+
+class TestDefaultSessionRootDir:
+    """Tests for the default session root directories.
+
+    The session root directory is a prefix of every path that a Job's programs work with. Many
+    applications used in Jobs are not long-path aware, so they remain subject to the legacy Windows
+    MAX_PATH (260 character) limit. These defaults are kept short on purpose - every character in
+    them is a character that a Job's own paths cannot use.
+    """
+
+    # The number of characters that the defaults are allowed to consume of the legacy Windows
+    # MAX_PATH (260 character) budget. Do not raise this without understanding the impact on Jobs
+    # that use applications which are not long-path aware.
+    MAX_DEFAULT_LENGTH = 16
+
+    def test_posix_default(self) -> None:
+        # THEN
+        assert str(settings_mod.DEFAULT_POSIX_SESSION_ROOT_DIR) == "/sessions"
+
+    @pytest.mark.parametrize(
+        argnames=("system_drive", "expected_default"),
+        argvalues=(
+            pytest.param("C:", "C:\\OpenJD", id="system-drive-c"),
+            pytest.param("D:", "D:\\OpenJD", id="system-drive-d"),
+            pytest.param(None, "C:\\OpenJD", id="system-drive-not-set"),
+        ),
+    )
+    def test_windows_default(self, system_drive: str | None, expected_default: str) -> None:
+        """Asserts that the default Windows session root directory is a directory named "OpenJD" in
+        the root directory of the system drive"""
+        # GIVEN
+        environ = {key: value for key, value in os.environ.items() if key != "SYSTEMDRIVE"}
+        if system_drive is not None:
+            environ["SYSTEMDRIVE"] = system_drive
+
+        try:
+            with patch.dict(settings_mod.os.environ, environ, clear=True):
+                # WHEN
+                # The default is computed at module import time, so the module is re-imported with
+                # the environment above in place.
+                importlib.reload(settings_mod)
+
+                # THEN
+                assert str(settings_mod.DEFAULT_WINDOWS_SESSION_ROOT_DIR) == expected_default
+        finally:
+            importlib.reload(settings_mod)
+
+    @pytest.mark.parametrize(
+        argnames="default_name",
+        argvalues=(
+            "DEFAULT_POSIX_SESSION_ROOT_DIR",
+            "DEFAULT_WINDOWS_SESSION_ROOT_DIR",
+        ),
+    )
+    def test_default_is_short(self, default_name: str) -> None:
+        """Asserts that the default session root directories stay within their character budget"""
+        # GIVEN
+        default = str(getattr(settings_mod, default_name))
+
+        # THEN
+        assert len(default) <= self.MAX_DEFAULT_LENGTH, (
+            f"{default_name} ({default}) is {len(default)} characters long, which leaves too "
+            "little of the Windows MAX_PATH budget for the paths that Jobs use"
+        )
 
 
 def test_customize_sources_config_file_exists(

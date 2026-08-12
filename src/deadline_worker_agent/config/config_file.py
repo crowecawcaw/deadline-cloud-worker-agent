@@ -122,7 +122,7 @@ subdirectories under. This value is overridden when the DEADLINE_WORKER_SESSION_
 variable is set or the --session-root-dir command-line argument is specified.
 
 The default session root directory on POSIX systems is "/sessions" and on Windows systems is
-"C:\ProgramData\Amazon\OpenJD".
+"C:\OpenJD".
 
 Uncomment the line below and replace the value with your desired session root directory:
 """.lstrip(),

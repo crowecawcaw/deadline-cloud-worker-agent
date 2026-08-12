@@ -996,6 +996,7 @@ class TestProvisionDirectories:
             group_permission=FileSystemPermissionEnum.FULL_CONTROL,
             agent_user_permission=None,
             users_group_permission=FileSystemPermissionEnum.LIST_DIRECTORY_AND_READ,
+            disable_permission_inheritance=True,
         )
 
 

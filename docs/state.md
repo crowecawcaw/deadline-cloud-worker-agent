@@ -183,14 +183,26 @@ the platform-specific defaults are:
 | Platform | Default session root directory |
 | --- | --- |
 | POSIX | `/sessions` |
-| Windows | `C:\ProgramData\Amazon\OpenJD` |
+| Windows | `C:\OpenJD` (`%SYSTEMDRIVE%\OpenJD`) |
 
-Session directories are created as children of the session root directory. The directories begin
-with the session ID, with trailing random characters:
+The Windows default is deliberately kept short. Many applications used in jobs are not long-path
+aware, so they remain subject to the legacy Windows `MAX_PATH` (260 character) limit regardless of
+how the host or the worker agent is configured. Every character in the session root directory is a
+character that a job's own paths cannot use. The installer provisions the session root directory
+with restrictive ACLs (full control for the worker agent user and `Administrators`, list/read for
+`Users`), so placing it at the root of the system drive does not make it writable by other users.
+
+Session directories are created as children of the session root directory. The directory name is
+derived from the trailing characters of the session ID followed by random characters. Like the
+session root directory, it is kept short so that it consumes as little of the Windows `MAX_PATH`
+budget as possible:
 
 ```
-<SESSION_ROOT_DIR>/<SESSION_ID>_a159c9
+<SESSION_ROOT_DIR>/88ffea0li90dcr
 ```
+
+The name of the session directory is determined by the `openjd-sessions` library and is subject to
+change. Do not depend on its exact form.
 
 These directories are populated by the worker agent with files created to run the session. This
 includes:
@@ -212,5 +224,12 @@ worker session directories using:
 
 These directories contain job data and should be secured accordingly. Consult the
 [security best practices][aws-deadline-cloud-security-best-practices].
+
+Worker hosts that were installed by an earlier version of the installer have the session root
+directory that was current at install time written into their worker agent config file, so
+upgrading the worker agent package alone does not move their session directories. To adopt a new
+default on an existing worker host, re-run `install-deadline-worker`, which provisions the new
+session root directory and updates the config file. The previous session root directory is left in
+place and can be removed once no session directories remain under it.
 
 [aws-deadline-cloud-security-best-practices]: https://docs.aws.amazon.com/deadline-cloud/latest/userguide/security-best-practices.html#worker-hosts
