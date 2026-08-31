@@ -202,11 +202,24 @@ class JobAttachmentSettings:
     root_prefix: str
     """The top-level prefix that all other prefixes are relative to"""
 
+    multi_region_s3_bucket_name: str | None = None
+    """A regional cache bucket for multi-region fleets. When set, this worker
+    is running in a satellite region and reads/writes job attachments here,
+    transferring objects to/from the home bucket only when missing.
+    None when the worker is not part of a multi-region fleet or is in the
+    fleet's home region."""
+
+    multi_region_root_prefix: str | None = None
+    """The top-level prefix for the regional cache bucket. Set alongside
+    multi_region_s3_bucket_name."""
+
     @classmethod
     def from_boto(cls, data: JobAttachmentSettingsBoto) -> JobAttachmentSettings:
         return JobAttachmentSettings(
             s3_bucket_name=data["s3BucketName"],
             root_prefix=data["rootPrefix"],
+            multi_region_s3_bucket_name=data.get("multiRegionS3BucketName"),
+            multi_region_root_prefix=data.get("multiRegionRootPrefix"),
         )
 
 
@@ -416,6 +429,8 @@ class JobDetails:
                     fields=(
                         Field(key="s3BucketName", expected_type=str, required=True),
                         Field(key="rootPrefix", expected_type=str, required=True),
+                        Field(key="multiRegionS3BucketName", expected_type=str, required=False),
+                        Field(key="multiRegionRootPrefix", expected_type=str, required=False),
                     ),
                 ),
                 Field(key="queueRoleArn", expected_type=str, required=False),

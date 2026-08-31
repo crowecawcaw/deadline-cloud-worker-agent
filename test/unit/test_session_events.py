@@ -88,7 +88,12 @@ def test_logging_allow_list():
                 "entities": {
                     "jobDetails": {
                         "jobId": True,
-                        "jobAttachmentSettings": {"s3BucketName": True, "rootPrefix": True},
+                        "jobAttachmentSettings": {
+                            "s3BucketName": True,
+                            "rootPrefix": True,
+                            "multiRegionS3BucketName": True,
+                            "multiRegionRootPrefix": True,
+                        },
                         "jobRunAsUser": True,
                         "logGroupName": True,
                         "queueRoleArn": True,

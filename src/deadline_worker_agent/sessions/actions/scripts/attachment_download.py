@@ -2,15 +2,18 @@
 
 #! /usr/bin/env python3
 import argparse
+import concurrent.futures
 import dataclasses
 import functools
 import json
+import random
 import sys
 import time
 import os
 import boto3
 import boto3.session
-from typing import cast, Any, Callable, Dict, List, TypeVar
+from botocore.exceptions import ClientError
+from typing import cast, Any, Callable, Dict, List, Optional, TypeVar
 
 from deadline.job_attachments.download import download_files_from_manifests
 from deadline.job_attachments.asset_manifests.decode import decode_manifest
@@ -79,8 +82,14 @@ class AttachmentDownloadLatencies:
 
     load_worker_manifest_properties: int = 0
     build_merged_manifests_by_root: int = 0
+    ensure_cache_populated: int = 0
     perform_download: int = 0
     total: int = 0
+
+
+# Concurrency for the cross-region "does this object exist? if not, copy" pass.
+# S3 cross-region CopyObject is IO-bound and can sustain many parallel requests.
+CACHE_SYNC_MAX_WORKERS = 32
 
 
 @failure_telemetry
@@ -137,6 +146,107 @@ def build_merged_manifests_by_root(
             print(f"Root {worker_prop.root_path} contains no input manifest to sync.")
 
     return manifests_by_root
+
+
+def _collect_cas_keys(
+    cas_prefix: str,
+    manifests_by_root: Dict[str, BaseAssetManifest],
+) -> List[str]:
+    """Return the deduplicated set of CAS S3 keys referenced by ``manifests_by_root``."""
+    keys: set = set()
+    for manifest in manifests_by_root.values():
+        hash_alg = manifest.hashAlg.value  # type: ignore[attr-defined]
+        for file in manifest.paths:
+            keys.add(f"{cas_prefix}/{file.hash}.{hash_alg}")
+    return list(keys)
+
+
+def _copy_if_missing(
+    s3_client: Any,
+    cache_bucket: str,
+    home_bucket: str,
+    key: str,
+) -> str:
+    """Head the object in ``cache_bucket``; on 404 copy from ``home_bucket``.
+
+    Returns one of ``"present"``, ``"copied"``, ``"already-copied"``. ``"already-copied"``
+    is returned when the copy target was created by another process between the
+    head and the copy attempt (raced with a peer).
+    """
+    try:
+        s3_client.head_object(Bucket=cache_bucket, Key=key)
+        return "present"
+    except ClientError as e:
+        status = int(e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+        code = e.response.get("Error", {}).get("Code", "")
+        if status != 404 and code not in ("404", "NoSuchKey", "NotFound"):
+            raise
+
+    s3_client.copy_object(
+        Bucket=cache_bucket,
+        Key=key,
+        CopySource={"Bucket": home_bucket, "Key": key},
+    )
+    return "copied"
+
+
+@failure_telemetry
+def ensure_cache_populated(
+    s3_client: Any,
+    cache_settings: JobAttachmentS3Settings,
+    home_settings: JobAttachmentS3Settings,
+    manifests_by_root: Dict[str, BaseAssetManifest],
+) -> Dict[str, int]:
+    """For each CAS object referenced by ``manifests_by_root``, ensure it exists in
+    ``cache_settings``' bucket, copying from ``home_settings`` on miss.
+
+    The key ordering is randomized so that two satellite workers syncing the same
+    manifest are less likely to attempt to copy the same object at the same time
+    (see the MRF cache-sync design doc).
+    """
+    cache_bucket = cache_settings.s3BucketName
+    home_bucket = home_settings.s3BucketName
+    cache_cas_prefix = cache_settings.full_cas_prefix()
+    home_cas_prefix = home_settings.full_cas_prefix()
+
+    if cache_cas_prefix != home_cas_prefix:
+        # We currently assume both buckets use the same rootPrefix so a CAS
+        # key can be reused verbatim. The service enforces this today; if it
+        # ever diverges we would need to translate keys per bucket here.
+        raise ValueError(
+            f"Home and cache job attachment rootPrefixes differ ({home_cas_prefix!r} vs "
+            f"{cache_cas_prefix!r}); cross-region cache sync requires them to match."
+        )
+
+    keys = _collect_cas_keys(cache_cas_prefix, manifests_by_root)
+    random.shuffle(keys)
+
+    counts = {"present": 0, "copied": 0}
+    if not keys:
+        return counts
+
+    print(
+        f"Multi-region cache: ensuring {len(keys)} object(s) are present in "
+        f"s3://{cache_bucket}/{cache_cas_prefix}/ (copying missing objects from "
+        f"s3://{home_bucket}/{home_cas_prefix}/)"
+    )
+
+    start = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CACHE_SYNC_MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(_copy_if_missing, s3_client, cache_bucket, home_bucket, key)
+            for key in keys
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            counts[result] = counts.get(result, 0) + 1
+
+    elapsed = time.perf_counter() - start
+    print(
+        f"Multi-region cache: {counts.get('copied', 0)} copied, "
+        f"{counts.get('present', 0)} already present ({elapsed:.1f}s)"
+    )
+    return counts
 
 
 @failure_telemetry
@@ -225,6 +335,18 @@ def main() -> None:
         help="Worker manifest properties file",
         required=False,
     )
+    parser.add_argument(
+        "-hs3",
+        "--home-s3-uri",
+        type=str,
+        help=(
+            "Home-region S3 root URI. When provided, the worker is running in a "
+            "satellite region: missing CAS objects are copied from this bucket to "
+            "the regional cache bucket (--s3-uri) before downloading."
+        ),
+        required=False,
+        default=None,
+    )
 
     args = parser.parse_args()
 
@@ -238,9 +360,24 @@ def main() -> None:
     manifests_by_root = build_merged_manifests_by_root(worker_manifest_properties)
     latencies.build_merged_manifests_by_root = time.perf_counter_ns() - start_t
 
-    print("\nStarting download...")
-
     s3_settings = JobAttachmentS3Settings.from_s3_root_uri(args.s3_uri)
+    home_s3_settings: Optional[JobAttachmentS3Settings] = (
+        JobAttachmentS3Settings.from_s3_root_uri(args.home_s3_uri) if args.home_s3_uri else None
+    )
+
+    boto_session = boto3.session.Session()
+
+    if home_s3_settings is not None:
+        start_t = time.perf_counter_ns()
+        ensure_cache_populated(
+            s3_client=boto_session.client("s3"),
+            cache_settings=s3_settings,
+            home_settings=home_s3_settings,
+            manifests_by_root=manifests_by_root,
+        )
+        latencies.ensure_cache_populated = time.perf_counter_ns() - start_t
+
+    print("\nStarting download...")
 
     start_t = time.perf_counter_ns()
     perform_download(s3_settings, manifests_by_root)

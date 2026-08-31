@@ -20,6 +20,8 @@ def mock_session():
     # Mock job details
     session._job_details.job_attachment_settings.s3_bucket_name = "test-bucket"
     session._job_details.job_attachment_settings.root_prefix = "test-prefix"
+    session._job_details.job_attachment_settings.multi_region_s3_bucket_name = None
+    session._job_details.job_attachment_settings.multi_region_root_prefix = None
 
     return session
 

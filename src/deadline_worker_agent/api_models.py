@@ -281,6 +281,17 @@ class JobAttachmentQueueSettings(TypedDict):
     rootPrefix: str
     """The prefix for all job attachment object keys"""
 
+    multiRegionS3BucketName: NotRequired[str]
+    """Name of a regional cache bucket for a multi-region fleet.
+
+    When set, satellite-region workers read and write job attachment objects
+    against this bucket, transferring objects to/from the home S3 bucket only
+    when they are missing. Home-region workers do not receive this field.
+    """
+
+    multiRegionRootPrefix: NotRequired[str]
+    """The prefix for all job attachment object keys within the regional cache bucket."""
+
 
 class ManifestProperties(TypedDict):
     rootPath: str

@@ -210,6 +210,20 @@ def job_details_only_run_as_worker_agent_user() -> JobDetails:
                 "jobId": "job-0000",
                 "logGroupName": "/aws/deadline/queue-0000",
                 "schemaVersion": "jobtemplate-0000-00",
+                "jobAttachmentSettings": {
+                    "s3BucketName": "mybucket",
+                    "rootPrefix": "myprefix",
+                    "multiRegionS3BucketName": "regional-cache-bucket",
+                    "multiRegionRootPrefix": "myprefix",
+                },
+            },
+            id="valid jobAttachmentSettings with multi-region cache",
+        ),
+        pytest.param(
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-0000-00",
                 "parameters": {
                     "param1": {
                         "string": "param1value",
@@ -808,3 +822,40 @@ class TestJobDetailsFromBotoExtensions:
         )
         result = JobDetails.from_boto(data)
         assert result.extensions == ["EXPR", "WRAP_ACTIONS"]
+
+
+class TestJobAttachmentSettingsMultiRegion:
+    """Tests for the multi-region fields on JobAttachmentSettings."""
+
+    def _base_data(self, ja_settings: dict) -> JobDetailsData:
+        return cast(
+            JobDetailsData,
+            {
+                "jobId": "job-0000",
+                "logGroupName": "/aws/deadline/queue-0000",
+                "schemaVersion": "jobtemplate-2023-09",
+                "jobAttachmentSettings": ja_settings,
+            },
+        )
+
+    def test_multi_region_fields_absent_default_to_none(self) -> None:
+        data = self._base_data({"s3BucketName": "home-bucket", "rootPrefix": "prefix"})
+        settings = JobDetails.from_boto(data).job_attachment_settings
+        assert settings is not None
+        assert settings.s3_bucket_name == "home-bucket"
+        assert settings.multi_region_s3_bucket_name is None
+        assert settings.multi_region_root_prefix is None
+
+    def test_multi_region_fields_populated(self) -> None:
+        data = self._base_data(
+            {
+                "s3BucketName": "home-bucket",
+                "rootPrefix": "prefix",
+                "multiRegionS3BucketName": "regional-cache",
+                "multiRegionRootPrefix": "prefix",
+            }
+        )
+        settings = JobDetails.from_boto(data).job_attachment_settings
+        assert settings is not None
+        assert settings.multi_region_s3_bucket_name == "regional-cache"
+        assert settings.multi_region_root_prefix == "prefix"

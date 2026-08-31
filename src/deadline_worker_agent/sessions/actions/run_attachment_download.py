@@ -100,6 +100,7 @@ class AttachmentDownloadAction(OpenjdAction):
         self,
         worker_manifest_properties_list: list[WorkerManifestProperties],
         s3_settings: JobAttachmentS3Settings,
+        home_s3_settings: Optional[JobAttachmentS3Settings] = None,
     ) -> None:
         """Sets the step script for the action
 
@@ -108,7 +109,12 @@ class AttachmentDownloadAction(OpenjdAction):
         worker_manifest_properties_list : list[WorkerManifestProperties]
             The worker manifest properties list containing manifest data
         s3_settings : JobAttachmentS3Settings
-            The job attachment S3 settings
+            The in-region job attachment S3 settings the worker downloads from.
+            For satellite-region workers, this is the regional cache bucket.
+        home_s3_settings : Optional[JobAttachmentS3Settings]
+            The home-region job attachment S3 settings. When provided (satellite
+            worker), the download script copies missing objects from this bucket
+            into ``s3_settings`` before downloading.
         """
         # Create embedded files for each manifest and collect temporary paths
         embedded_files = []
@@ -136,6 +142,13 @@ class AttachmentDownloadAction(OpenjdAction):
             ArgString("-wp"),
             ArgString("{{ Task.File.WorkerManifestProperties }}"),
         ]
+        if home_s3_settings is not None:
+            args.extend(
+                [
+                    ArgString("-hs3"),
+                    ArgString(home_s3_settings.to_s3_root_uri()),
+                ]
+            )
 
         executable_path = Path(sys.executable)
         python_path = executable_path.parent / executable_path.name.lower().replace(
@@ -214,10 +227,18 @@ class AttachmentDownloadAction(OpenjdAction):
         assert job_attachment_settings.root_prefix is not None
         assert session._asset_sync is not None
 
-        s3_settings = JobAttachmentS3Settings(
+        home_s3_settings = JobAttachmentS3Settings(
             s3BucketName=job_attachment_settings.s3_bucket_name,
             rootPrefix=job_attachment_settings.root_prefix,
         )
+        if job_attachment_settings.multi_region_s3_bucket_name is not None:
+            assert job_attachment_settings.multi_region_root_prefix is not None
+            s3_settings = JobAttachmentS3Settings(
+                s3BucketName=job_attachment_settings.multi_region_s3_bucket_name,
+                rootPrefix=job_attachment_settings.multi_region_root_prefix,
+            )
+        else:
+            s3_settings = home_s3_settings
 
         manifest_properties_list: list[ManifestProperties] = []
         if not step_dependencies:
@@ -275,11 +296,16 @@ class AttachmentDownloadAction(OpenjdAction):
                     {path_mapping.source_path: path_mapping.destination_path}
                 )
 
-        # Aggregate manifests (with step step dependency handling)
+        # Aggregate manifests (with step step dependency handling).
+        # Manifests always live in the home bucket -- job input manifests are
+        # uploaded there by the submitter, and step output manifests are copied
+        # there by AttachmentUploadAction. Read them cross-region; they are
+        # small and this avoids a race with concurrent output uploads that
+        # haven't finished copying manifests into the regional cache yet.
         merged_manifests_by_root: dict[str, BaseAssetManifest] = (
             session._asset_sync._aggregate_asset_root_manifests(
                 session_dir=session.working_directory,
-                s3_settings=s3_settings,
+                s3_settings=home_s3_settings,
                 queue_id=session._queue_id,
                 job_id=session._queue._job_id,
                 attachments=attachments,
@@ -356,6 +382,9 @@ class AttachmentDownloadAction(OpenjdAction):
         else:
             self.set_step_script(
                 s3_settings=s3_settings,
+                home_s3_settings=(
+                    home_s3_settings if s3_settings is not home_s3_settings else None
+                ),
                 worker_manifest_properties_list=download_manifest_properties_list,
             )
             assert self._step_script is not None

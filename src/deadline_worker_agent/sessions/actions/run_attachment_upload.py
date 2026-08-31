@@ -76,15 +76,21 @@ class AttachmentUploadAction(OpenjdAction):
         self,
         s3_settings: JobAttachmentS3Settings,
         worker_manifest_properties_list: list[WorkerManifestProperties],
+        home_s3_settings: Optional[JobAttachmentS3Settings] = None,
     ) -> None:
         """Sets the step script for the action
 
         Parameters
         ----------
         s3_settings : JobAttachmentS3Settings
-            The S3 settings for the job attachment
+            The in-region S3 settings the worker uploads output attachments to.
+            For satellite-region workers this is the regional cache bucket.
         worker_manifest_properties_list : list
             List of worker manifest properties for enhanced processing
+        home_s3_settings : Optional[JobAttachmentS3Settings]
+            The home-region S3 settings. When provided (satellite worker), the
+            upload script copies each newly uploaded object from
+            ``s3_settings`` into this bucket so the home region has the outputs.
         """
 
         # Create embedded file for worker manifest properties
@@ -103,6 +109,13 @@ class AttachmentUploadAction(OpenjdAction):
             ArgString("-wp"),
             ArgString("{{ Task.File.WorkerManifestProperties }}"),
         ]
+        if home_s3_settings is not None:
+            args.extend(
+                [
+                    ArgString("-hs3"),
+                    ArgString(home_s3_settings.to_s3_root_uri()),
+                ]
+            )
 
         executable_path = Path(sys.executable)
         python_path = executable_path.parent / executable_path.name.lower().replace(
@@ -171,13 +184,24 @@ class AttachmentUploadAction(OpenjdAction):
         assert job_attachment_settings.s3_bucket_name is not None
         assert job_attachment_settings.root_prefix is not None
 
-        s3_settings = JobAttachmentS3Settings(
+        home_s3_settings = JobAttachmentS3Settings(
             s3BucketName=job_attachment_settings.s3_bucket_name,
             rootPrefix=job_attachment_settings.root_prefix,
         )
+        if job_attachment_settings.multi_region_s3_bucket_name is not None:
+            assert job_attachment_settings.multi_region_root_prefix is not None
+            s3_settings = JobAttachmentS3Settings(
+                s3BucketName=job_attachment_settings.multi_region_s3_bucket_name,
+                rootPrefix=job_attachment_settings.multi_region_root_prefix,
+            )
+            home_settings_arg: Optional[JobAttachmentS3Settings] = home_s3_settings
+        else:
+            s3_settings = home_s3_settings
+            home_settings_arg = None
 
         self.set_step_script(
             s3_settings=s3_settings,
+            home_s3_settings=home_settings_arg,
             worker_manifest_properties_list=session.get_worker_manifest_properties_list(),
         )
 

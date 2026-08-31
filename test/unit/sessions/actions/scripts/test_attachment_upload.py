@@ -718,3 +718,132 @@ class TestTelemetry:
         assert "parse_worker_manifest_properties" in latencies
         assert "upload_output_assets" in latencies
         assert "total" in latencies
+
+
+class TestMultiRegionCopyToHome:
+    """Coverage for the multi-region output copy-back."""
+
+    def test_parse_args_accepts_home_s3_uri(self):
+        args = attachment_upload_mod.parse_args(
+            [
+                "-s3",
+                "s3://cache-bucket/prefix",
+                "-wp",
+                "/tmp/wp.json",
+                "-hs3",
+                "s3://home-bucket/prefix",
+            ]
+        )
+        assert args.s3_uri == "s3://cache-bucket/prefix"
+        assert args.home_s3_uri == "s3://home-bucket/prefix"
+
+    def test_parse_args_home_s3_uri_defaults_none(self):
+        args = attachment_upload_mod.parse_args(
+            ["-s3", "s3://cache-bucket/prefix", "-wp", "/tmp/wp.json"]
+        )
+        assert args.home_s3_uri is None
+
+    def test_copy_outputs_to_home_bucket_copies_all_keys(self, tmp_path: Path):
+        # Two output manifests: 3 unique CAS keys total, plus 2 manifest keys.
+        manifest_a = tmp_path / "a.manifest"
+        manifest_a.write_text(
+            json.dumps(
+                {
+                    "manifestVersion": "2023-03-03",
+                    "hashAlg": "xxh128",
+                    "totalSize": 2,
+                    "paths": [
+                        {"path": "f1", "hash": "aaaa", "size": 1, "mtime": 0},
+                        {"path": "f2", "hash": "bbbb", "size": 1, "mtime": 0},
+                    ],
+                }
+            )
+        )
+        manifest_b = tmp_path / "b.manifest"
+        manifest_b.write_text(
+            json.dumps(
+                {
+                    "manifestVersion": "2023-03-03",
+                    "hashAlg": "xxh128",
+                    "totalSize": 1,
+                    # Overlapping hash "aaaa" with manifest_a; should be deduped.
+                    "paths": [
+                        {"path": "f3", "hash": "aaaa", "size": 1, "mtime": 0},
+                        {"path": "f4", "hash": "cccc", "size": 1, "mtime": 0},
+                    ],
+                }
+            )
+        )
+
+        from deadline.job_attachments.models import UploadManifestInfo
+
+        manifest_infos = [
+            UploadManifestInfo(
+                output_manifest_path="prefix/Manifests/a_output",
+                output_manifest_hash="hash-a",
+                source_path="/src/a",
+            ),
+            UploadManifestInfo(
+                output_manifest_path="prefix/Manifests/b_output",
+                output_manifest_hash="hash-b",
+                source_path="/src/b",
+            ),
+        ]
+
+        s3_client = Mock()
+        cache = JobAttachmentS3Settings(s3BucketName="cache-bucket", rootPrefix="prefix")
+        home = JobAttachmentS3Settings(s3BucketName="home-bucket", rootPrefix="prefix")
+
+        copied = attachment_upload_mod.copy_outputs_to_home_bucket(
+            s3_client=s3_client,
+            cache_settings=cache,
+            home_settings=home,
+            manifest_infos=manifest_infos,
+            root_path_to_output_manifest={
+                "/src/a": str(manifest_a),
+                "/src/b": str(manifest_b),
+            },
+        )
+
+        # 3 unique CAS keys (aaaa, bbbb, cccc) + 2 manifest keys.
+        assert copied == 5
+        copy_calls = s3_client.copy_object.call_args_list
+        assert len(copy_calls) == 5
+        for kwargs in (c.kwargs for c in copy_calls):
+            assert kwargs["Bucket"] == "home-bucket"
+            assert kwargs["CopySource"]["Bucket"] == "cache-bucket"
+            # Verified key exists on both sides at the same S3 key.
+            assert kwargs["Key"] == kwargs["CopySource"]["Key"]
+
+        copied_keys = {c.kwargs["Key"] for c in copy_calls}
+        assert "prefix/Data/aaaa.xxh128" in copied_keys
+        assert "prefix/Data/bbbb.xxh128" in copied_keys
+        assert "prefix/Data/cccc.xxh128" in copied_keys
+        assert "prefix/Manifests/a_output" in copied_keys
+        assert "prefix/Manifests/b_output" in copied_keys
+
+    def test_copy_outputs_rejects_mismatched_root_prefixes(self):
+        with pytest.raises(ValueError, match="rootPrefixes differ"):
+            attachment_upload_mod.copy_outputs_to_home_bucket(
+                s3_client=Mock(),
+                cache_settings=JobAttachmentS3Settings(
+                    s3BucketName="cache-bucket", rootPrefix="cache-prefix"
+                ),
+                home_settings=JobAttachmentS3Settings(
+                    s3BucketName="home-bucket", rootPrefix="home-prefix"
+                ),
+                manifest_infos=[],
+                root_path_to_output_manifest={},
+            )
+
+    def test_copy_outputs_returns_zero_when_nothing_to_copy(self):
+        result = attachment_upload_mod.copy_outputs_to_home_bucket(
+            s3_client=Mock(),
+            cache_settings=JobAttachmentS3Settings(
+                s3BucketName="cache-bucket", rootPrefix="prefix"
+            ),
+            home_settings=JobAttachmentS3Settings(s3BucketName="home-bucket", rootPrefix="prefix"),
+            manifest_infos=[],
+            root_path_to_output_manifest={},
+        )
+        assert result == 0

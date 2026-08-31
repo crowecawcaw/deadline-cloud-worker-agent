@@ -13,6 +13,7 @@ to handle job output file uploads after task completion.
 
 #! /usr/bin/env python3
 import argparse
+import concurrent.futures
 import dataclasses
 import functools
 import sys
@@ -23,6 +24,9 @@ from typing import cast, Any, Callable, Optional, TypeVar
 from pathlib import Path
 from dataclasses import asdict
 import glob
+
+import boto3
+import boto3.session
 
 from deadline.job_attachments.api import human_readable_file_size
 from deadline.job_attachments.asset_manifests.decode import decode_manifest
@@ -80,7 +84,12 @@ class AttachmentUploadLatences:
     snapshot: int = 0
     parse_worker_manifest_properties: int = 0
     upload_output_assets: int = 0
+    copy_to_home_bucket: int = 0
     total: int = 0
+
+
+# Concurrency for the post-upload cross-region CopyObject pass on satellite workers.
+CACHE_SYNC_MAX_WORKERS = 32
 
 
 @failure_telemetry
@@ -254,6 +263,18 @@ def parse_args(args):
         help="Path to JSON file containing worker manifest properties configuration",
         required=True,
     )
+    parser.add_argument(
+        "-hs3",
+        "--home-s3-uri",
+        type=str,
+        help=(
+            "Home-region S3 root URI. When provided, every object written to the "
+            "cache bucket (--s3-uri) during this upload is copied to the home bucket "
+            "so the home region has the outputs."
+        ),
+        required=False,
+        default=None,
+    )
     return parser.parse_args(args)
 
 
@@ -366,6 +387,73 @@ def upload_output_assets(
     return output_manifest_info_list
 
 
+@failure_telemetry
+def copy_outputs_to_home_bucket(
+    s3_client: Any,
+    cache_settings: JobAttachmentS3Settings,
+    home_settings: JobAttachmentS3Settings,
+    manifest_infos: list[UploadManifestInfo],
+    root_path_to_output_manifest: dict[str, str],
+) -> int:
+    """Copy every object the upload just wrote into the regional cache bucket
+    over to the home bucket.
+
+    Uploaded outputs comprise two sets of S3 keys per manifest:
+
+    1. Every CAS data object listed in the local snapshot manifest at
+       ``root_path_to_output_manifest[<root>]``, under ``full_cas_prefix()``.
+    2. The output manifest object itself, whose full key is
+       ``UploadManifestInfo.output_manifest_path``.
+
+    Returns the number of objects copied.
+    """
+    if cache_settings.full_cas_prefix() != home_settings.full_cas_prefix():
+        raise ValueError(
+            "Home and cache job attachment rootPrefixes differ "
+            f"({home_settings.rootPrefix!r} vs {cache_settings.rootPrefix!r}); "
+            "cross-region output copy-back requires them to match."
+        )
+
+    hash_alg_by_root: dict[str, str] = {}
+    cas_keys: set[str] = set()
+    cache_cas_prefix = cache_settings.full_cas_prefix()
+
+    for root_path, local_manifest_path in root_path_to_output_manifest.items():
+        with open(local_manifest_path, "r") as f:
+            manifest = decode_manifest(f.read())
+        hash_alg_by_root[root_path] = manifest.hashAlg.value  # type: ignore[attr-defined]
+        for file in manifest.paths:
+            cas_keys.add(f"{cache_cas_prefix}/{file.hash}.{hash_alg_by_root[root_path]}")
+
+    manifest_keys = {info.output_manifest_path for info in manifest_infos}
+
+    all_keys = cas_keys | manifest_keys
+    if not all_keys:
+        return 0
+
+    print(
+        f"Multi-region cache: copying {len(all_keys)} uploaded object(s) from "
+        f"s3://{cache_settings.s3BucketName}/ to home bucket "
+        f"s3://{home_settings.s3BucketName}/"
+    )
+
+    def _copy_one(key: str) -> None:
+        s3_client.copy_object(
+            Bucket=home_settings.s3BucketName,
+            Key=key,
+            CopySource={"Bucket": cache_settings.s3BucketName, "Key": key},
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CACHE_SYNC_MAX_WORKERS) as executor:
+        futures = [executor.submit(_copy_one, key) for key in all_keys]
+        # Surface any exception; a failed copy-back means the home region does
+        # not have the outputs and dependent steps would break.
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+
+    return len(all_keys)
+
+
 def should_use_task_chunking_format() -> bool:
     """Determine if task chunking format (without task_id) should be used."""
     return not os.environ.get("DEADLINE_TASK_ID")
@@ -462,6 +550,24 @@ def main(args=None):
         # ja_upload: is a key word that is detected in the worker agent log filter
         # We're printing the manifest info to the logs so that we can re-load it as a manifest info in the worker agent process
         print(f"ja_upload: {json.dumps([asdict(info) for info in manifest_infos])}")
+
+        # For satellite-region workers on a multi-region fleet, mirror the
+        # uploaded objects into the home bucket so dependent steps and
+        # customer downloads see them. See the MRF cache-sync design doc.
+        if parsed_args.home_s3_uri:
+            cache_settings = JobAttachmentS3Settings.from_s3_root_uri(parsed_args.s3_uri)
+            home_settings = JobAttachmentS3Settings.from_s3_root_uri(parsed_args.home_s3_uri)
+            s3_client = boto3.session.Session().client("s3")
+
+            start_t = time.perf_counter_ns()
+            copy_outputs_to_home_bucket(
+                s3_client=s3_client,
+                cache_settings=cache_settings,
+                home_settings=home_settings,
+                manifest_infos=manifest_infos,
+                root_path_to_output_manifest=root_path_to_output_manifest,
+            )
+            latencies.copy_to_home_bucket = time.perf_counter_ns() - start_t
 
     # Always record latencies telemetry regardless of whether upload occurred
     total = time.perf_counter_ns() - total_start_time

@@ -469,6 +469,7 @@ class TestMainFunction:
         mock_args = Mock()
         mock_args.s3_uri = "s3://test-bucket/test-prefix"
         mock_args.worker_properties = "/path/to/worker/props.json"
+        mock_args.home_s3_uri = None
         mock_parse_args.return_value = mock_args
 
         mock_perf_counter.side_effect = [0.0, 5.5]  # start_time, end_time
@@ -523,6 +524,7 @@ class TestMainFunction:
         mock_args = Mock()
         mock_args.s3_uri = "s3://test-bucket/test-prefix"
         mock_args.worker_properties = "/path/to/worker/props.json"
+        mock_args.home_s3_uri = None
         mock_parse_args.return_value = mock_args
 
         mock_perf_counter.side_effect = [0.0, 5.5]  # start_time, end_time
@@ -563,6 +565,149 @@ class TestMainFunction:
 )
 def test_seconds_to_minutes_str(seconds: int, expected_str: str):
     assert _seconds_to_minutes_str(seconds) == expected_str
+
+
+class TestEnsureCachePopulated:
+    """Coverage for the multi-region cross-region copy-through in
+    ``ensure_cache_populated``.
+    """
+
+    def _make_manifest(self, hashes):
+        m = Mock()
+        m.hashAlg.value = "xxh128"
+        m.paths = [Mock(hash=h) for h in hashes]
+        return m
+
+    def test_copies_missing_objects_and_skips_present_ones(self):
+        from botocore.exceptions import ClientError
+
+        s3_client = Mock()
+
+        def head_side_effect(Bucket, Key):
+            if Key.endswith("aaaa.xxh128"):
+                # present in cache
+                return {}
+            raise ClientError(
+                {
+                    "Error": {"Code": "404", "Message": "Not Found"},
+                    "ResponseMetadata": {"HTTPStatusCode": 404},
+                },
+                "HeadObject",
+            )
+
+        s3_client.head_object.side_effect = head_side_effect
+
+        manifests = {"/root": self._make_manifest(["aaaa", "bbbb"])}
+
+        counts = attachment_download_mod.ensure_cache_populated(
+            s3_client=s3_client,
+            cache_settings=JobAttachmentS3Settings(
+                s3BucketName="cache-bucket", rootPrefix="prefix"
+            ),
+            home_settings=JobAttachmentS3Settings(s3BucketName="home-bucket", rootPrefix="prefix"),
+            manifests_by_root=manifests,
+        )
+
+        assert counts["present"] == 1
+        assert counts["copied"] == 1
+        # Exactly one CopyObject issued for the missing hash.
+        assert s3_client.copy_object.call_count == 1
+        kwargs = s3_client.copy_object.call_args.kwargs
+        assert kwargs["Bucket"] == "cache-bucket"
+        assert kwargs["Key"] == "prefix/Data/bbbb.xxh128"
+        assert kwargs["CopySource"] == {
+            "Bucket": "home-bucket",
+            "Key": "prefix/Data/bbbb.xxh128",
+        }
+
+    def test_rejects_mismatched_root_prefixes(self):
+        with pytest.raises(ValueError, match="rootPrefixes"):
+            attachment_download_mod.ensure_cache_populated(
+                s3_client=Mock(),
+                cache_settings=JobAttachmentS3Settings(
+                    s3BucketName="cache-bucket", rootPrefix="cache-prefix"
+                ),
+                home_settings=JobAttachmentS3Settings(
+                    s3BucketName="home-bucket", rootPrefix="home-prefix"
+                ),
+                manifests_by_root={"/root": self._make_manifest(["aaaa"])},
+            )
+
+    def test_reraises_non_404_head_errors(self):
+        from botocore.exceptions import ClientError
+
+        s3_client = Mock()
+        s3_client.head_object.side_effect = ClientError(
+            {
+                "Error": {"Code": "AccessDenied", "Message": "denied"},
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            },
+            "HeadObject",
+        )
+
+        with pytest.raises(ClientError):
+            attachment_download_mod.ensure_cache_populated(
+                s3_client=s3_client,
+                cache_settings=JobAttachmentS3Settings(
+                    s3BucketName="cache-bucket", rootPrefix="prefix"
+                ),
+                home_settings=JobAttachmentS3Settings(
+                    s3BucketName="home-bucket", rootPrefix="prefix"
+                ),
+                manifests_by_root={"/root": self._make_manifest(["aaaa"])},
+            )
+        s3_client.copy_object.assert_not_called()
+
+    def test_main_invokes_ensure_cache_when_home_uri_provided(self):
+        with (
+            patch.object(attachment_download_mod, "perform_download") as mock_perform,
+            patch.object(attachment_download_mod, "build_merged_manifests_by_root") as mock_build,
+            patch.object(attachment_download_mod, "load_worker_manifest_properties") as mock_load,
+            patch.object(attachment_download_mod, "ensure_cache_populated") as mock_ensure,
+            patch.object(
+                attachment_download_mod.argparse.ArgumentParser, "parse_args"
+            ) as mock_parse,
+        ):
+            mock_args = Mock()
+            mock_args.s3_uri = "s3://cache-bucket/prefix"
+            mock_args.home_s3_uri = "s3://home-bucket/prefix"
+            mock_args.worker_properties = "/tmp/wp.json"
+            mock_parse.return_value = mock_args
+            mock_load.return_value = [Mock()]
+            mock_build.return_value = {"root": Mock()}
+
+            main()
+
+            mock_ensure.assert_called_once()
+            kwargs = mock_ensure.call_args.kwargs
+            assert kwargs["cache_settings"].s3BucketName == "cache-bucket"
+            assert kwargs["home_settings"].s3BucketName == "home-bucket"
+            # perform_download should always target the cache bucket.
+            perform_kwargs = mock_perform.call_args
+            perform_settings = perform_kwargs.args[0]
+            assert perform_settings.s3BucketName == "cache-bucket"
+
+    def test_main_skips_ensure_cache_without_home_uri(self):
+        with (
+            patch.object(attachment_download_mod, "perform_download"),
+            patch.object(attachment_download_mod, "build_merged_manifests_by_root") as mock_build,
+            patch.object(attachment_download_mod, "load_worker_manifest_properties") as mock_load,
+            patch.object(attachment_download_mod, "ensure_cache_populated") as mock_ensure,
+            patch.object(
+                attachment_download_mod.argparse.ArgumentParser, "parse_args"
+            ) as mock_parse,
+        ):
+            mock_args = Mock()
+            mock_args.s3_uri = "s3://home-bucket/prefix"
+            mock_args.home_s3_uri = None
+            mock_args.worker_properties = "/tmp/wp.json"
+            mock_parse.return_value = mock_args
+            mock_load.return_value = [Mock()]
+            mock_build.return_value = {"root": Mock()}
+
+            main()
+
+            mock_ensure.assert_not_called()
 
 
 class TestTelemetry:
@@ -642,6 +787,7 @@ class TestTelemetry:
         """Test that latencies telemetry is recorded on successful completion."""
         # GIVEN
         mock_parse_args.return_value.s3_uri = "s3://test-bucket/test-object"
+        mock_parse_args.return_value.home_s3_uri = None
 
         # WHEN
         main()
